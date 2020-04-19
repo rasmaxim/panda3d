@@ -33,6 +33,11 @@
 #define ALC_ALL_DEVICES_SPECIFIER 0x1013
 #endif
 
+// Use ALC_SOFT_CHAIN extension (experimental)
+#ifndef AL_EFFECTSLOT_TARGET_SOFT
+#define AL_EFFECTSLOT_TARGET_SOFT 0xf000
+#endif
+
 using std::endl;
 using std::string;
 
@@ -67,6 +72,60 @@ void alc_audio_errcheck(const char *context,ALCdevice* device) {
   }
 }
 
+void al_efx_load_functions() {
+  /* Define a macro to help load the function pointers. */
+#define LOAD_PROC(T, x)  ((x) = (T)alGetProcAddress(#x))
+  LOAD_PROC(LPALGENEFFECTS, alGenEffects);
+  LOAD_PROC(LPALDELETEEFFECTS, alDeleteEffects);
+  LOAD_PROC(LPALISEFFECT, alIsEffect);
+  LOAD_PROC(LPALEFFECTI, alEffecti);
+  LOAD_PROC(LPALEFFECTIV, alEffectiv);
+  LOAD_PROC(LPALEFFECTF, alEffectf);
+  LOAD_PROC(LPALEFFECTFV, alEffectfv);
+  LOAD_PROC(LPALGETEFFECTI, alGetEffecti);
+  LOAD_PROC(LPALGETEFFECTIV, alGetEffectiv);
+  LOAD_PROC(LPALGETEFFECTF, alGetEffectf);
+  LOAD_PROC(LPALGETEFFECTFV, alGetEffectfv);
+
+  LOAD_PROC(LPALGENFILTERS, alGenFilters);
+  LOAD_PROC(LPALDELETEFILTERS, alDeleteFilters);
+  LOAD_PROC(LPALISFILTER, alIsFilter);
+  LOAD_PROC(LPALFILTERI, alFilteri);
+  LOAD_PROC(LPALFILTERIV, alFilteriv);
+  LOAD_PROC(LPALFILTERF, alFilterf);
+  LOAD_PROC(LPALFILTERFV, alFilterfv);
+  LOAD_PROC(LPALGETFILTERI, alGetFilteri);
+  LOAD_PROC(LPALGETFILTERIV, alGetFilteriv);
+  LOAD_PROC(LPALGETFILTERF, alGetFilterf);
+  LOAD_PROC(LPALGETFILTERFV, alGetFilterfv);
+
+  LOAD_PROC(LPALGENAUXILIARYEFFECTSLOTS, alGenAuxiliaryEffectSlots);
+  LOAD_PROC(LPALDELETEAUXILIARYEFFECTSLOTS, alDeleteAuxiliaryEffectSlots);
+  LOAD_PROC(LPALISAUXILIARYEFFECTSLOT, alIsAuxiliaryEffectSlot);
+  LOAD_PROC(LPALAUXILIARYEFFECTSLOTI, alAuxiliaryEffectSloti);
+  LOAD_PROC(LPALAUXILIARYEFFECTSLOTIV, alAuxiliaryEffectSlotiv);
+  LOAD_PROC(LPALAUXILIARYEFFECTSLOTF, alAuxiliaryEffectSlotf);
+  LOAD_PROC(LPALAUXILIARYEFFECTSLOTFV, alAuxiliaryEffectSlotfv);
+  LOAD_PROC(LPALGETAUXILIARYEFFECTSLOTI, alGetAuxiliaryEffectSloti);
+  LOAD_PROC(LPALGETAUXILIARYEFFECTSLOTIV, alGetAuxiliaryEffectSlotiv);
+  LOAD_PROC(LPALGETAUXILIARYEFFECTSLOTF, alGetAuxiliaryEffectSlotf);
+  LOAD_PROC(LPALGETAUXILIARYEFFECTSLOTFV, alGetAuxiliaryEffectSlotfv);
+#undef LOAD_PROC
+}
+
+/**
+* To interpolate effect parameter values
+*/
+float lerp(float t, float a, float b) {
+  return a + t * (b - a);
+}
+/**
+* To interpolate effect parameter values
+*/
+float inverse_lerp(float t, float a, float b) {
+  return (t - a) / (b - a);
+}
+
 /**
  * Factory Function
  */
@@ -74,7 +133,6 @@ AudioManager *Create_OpenALAudioManager() {
   audio_debug("Create_OpenALAudioManager()");
   return new OpenALAudioManager;
 }
-
 
 /**
  *
@@ -155,7 +213,12 @@ OpenALAudioManager() {
     if (_device != nullptr) {
       // We managed to get a device open.
       alcGetError(_device); // clear errors
-      _context = alcCreateContext(_device, nullptr);
+      
+      // Override ALC_MAX_AUXILIARY_SENDS 
+      // to connect more effects to one source (the default is 2)
+      const ALCint attrs[1] = { AL_EFX_NUM_SENDS };
+      
+      _context = alcCreateContext(_device, attrs);
       alc_audio_errcheck("alcCreateContext(_device, NULL)", _device);
       if (_context != nullptr) {
         _openal_active = true;
@@ -185,7 +248,29 @@ OpenALAudioManager() {
       audio_cat.debug()
         << "ALC_DEVICE_SPECIFIER:" << alcGetString(_device, ALC_DEVICE_SPECIFIER) << endl;
     }
-  }
+
+    // Check for EFX support
+    if (!alcIsExtensionPresent(alcGetContextsDevice(alcGetCurrentContext()), "ALC_EXT_EFX"))
+    {
+      _efx_supported = false;
+      audio_cat.warning() << "ALC_EFX_EXT is not supported\n";
+    }
+    else {
+      _efx_supported = true;
+      al_efx_load_functions();
+    }
+
+    // Check for effect chain support
+    if (!alIsExtensionPresent("AL_SOFTX_effect_chain"))
+    {
+      audio_cat.warning() << "AL_SOFTX_effect_chain is not supported\n";
+      _efx_chain_supported = false;
+    }
+    else {
+      _efx_chain_supported = true;
+    }
+
+   }
 
   if (audio_cat.is_debug()) {
     audio_cat.debug() << "AL_RENDERER:" << alGetString(AL_RENDERER) << endl;
@@ -234,6 +319,609 @@ shutdown() {
 bool OpenALAudioManager::
 is_valid() {
   return _is_valid;
+}
+
+/**
+ * Creates and configures OpenAL filter from a FilterConfig
+ * If filter already exists, it is reconfigured
+ */
+void OpenALAudioManager::make_filter(const FilterProperties::FilterConfig& conf) {
+  ReMutexHolder holder(_lock);
+
+  ALint filter_type;
+
+  switch (conf._type) {
+  case FilterProperties::FT_lowpass:
+    filter_type = AL_FILTER_LOWPASS;
+    break;
+  case FilterProperties::FT_highpass:
+    filter_type = AL_FILTER_HIGHPASS;
+    break;
+  default: 
+    return;
+  }
+
+  ALuint* pt_filter = &_al_efx_filters[filter_type];;
+  ALuint err;
+     
+   // If filter doesn't exist yet, create it
+  if (!alIsFilter(*pt_filter) || *pt_filter == AL_FILTER_NULL) {
+    alGenFilters(1, pt_filter);
+    alFilteri(*pt_filter, AL_FILTER_TYPE, filter_type);
+    err = alGetError();
+    if (err != AL_NO_ERROR) {
+      audio_error("OpenAL: can't create filter: " << alGetString(err));
+      return;
+    }
+  }
+
+  // Configure filter
+  float* params = (float*)&conf;
+  int num_params = 14;
+  if (audio_cat.is_debug()) {
+    audio_debug("Filter parametes: ");
+    for (int i = 1; i < num_params + 1; ++i) {
+      audio_debug("param: " << i << ": " << params[i]);
+    }
+  }
+
+  switch (conf._type) {
+  case FilterProperties::FT_lowpass:
+    // Resonance parameter is not present in OpenAL
+    alFilterf(*pt_filter, AL_LOWPASS_GAINHF, conf._a);
+    err = alGetError();
+    // Gain parameter from OpenAL is not used
+    break;
+  case FilterProperties::FT_highpass:
+    // Resonance parameter is not present in OpenAL
+    alFilterf(*pt_filter, AL_HIGHPASS_GAINLF, conf._a);
+    err = alGetError();
+    // Gain parameter from OpenAL is not used
+    break;
+  }
+
+  if (err != AL_NO_ERROR) {
+    audio_error("Couldn't configure filter, error: " << alGetString(err));
+    audio_error("Error parameter : " << conf._a);
+  }
+  else {
+    _al_efx_active_filter = *pt_filter;
+  }
+
+}
+
+/**
+ * Creates and configures OpenAL effect from a FilterConfig
+ * Each effect is loaded into the corresponding slot
+ * If effect already exists, it is reconfigured
+ * This methods tries to make OpenAL effects sound
+ * as close as possible to FMOD effects with the same parameters
+ * Note 1: some effects present in FMOD are not present in OpenAL
+ * Note 2: some parameters may have different effect or be comletely absent
+ */
+void OpenALAudioManager::make_effect(const FilterProperties::FilterConfig& conf) {
+  ReMutexHolder holder(_lock);
+
+  ALuint effect_type;
+  
+  switch (conf._type) {
+  case FilterProperties::FT_echo: 
+    effect_type = AL_EFFECT_ECHO;
+    break;
+  case FilterProperties::FT_flange:
+    effect_type = AL_EFFECT_FLANGER;
+    break;
+  case FilterProperties::FT_distort:
+    effect_type = AL_EFFECT_DISTORTION;
+    break;
+  case FilterProperties::FT_pitchshift:
+    effect_type = AL_EFFECT_PITCH_SHIFTER;
+    break;
+  case FilterProperties::FT_chorus:
+    effect_type = AL_EFFECT_CHORUS;
+    break;
+  case FilterProperties::FT_compress:
+    effect_type = AL_EFFECT_COMPRESSOR;
+    break;
+  case FilterProperties::FT_sfxreverb:
+    effect_type = AL_EFFECT_EAXREVERB;
+    break;
+  // Normalize and parametric EQ filters are not implemented in OpenAL EFX extenstion
+  case FilterProperties::FT_normalize:
+  case FilterProperties::FT_parameq:
+    audio_error("OpenAL: Filter type is not supported");
+    return;
+    break;
+  default:
+    audio_error("Garbage in DSP configuration data");
+    return;
+  }
+   
+  ALuint err;
+  ALuint* pt_effect = &_al_efx_effects[effect_type];
+
+  // If effect doesn't exist yet, create it
+  if (!alIsEffect(*pt_effect) || *pt_effect == AL_EFFECT_NULL) {
+    alGenEffects(1, pt_effect);
+    alEffecti(*pt_effect, AL_EFFECT_TYPE, effect_type);
+    err = alGetError();
+    if (err != AL_NO_ERROR) {
+      audio_error("OpenAL: can't create effect: " << alGetString(err));
+      return;
+    }
+    else {
+      if (audio_cat.is_debug()) {
+        audio_debug("Created effect " << *pt_effect);
+      }
+    }
+  }
+
+  // Configure effect
+  const int num_params = 14;
+  ALenum errors[num_params] = { AL_NO_ERROR };
+  ALuint effect = *pt_effect;
+  float* params = (float*)&conf;
+
+  // Allocate variables for pitch shifter effect
+  float tune, coarse, fine;
+
+  // DEBUG PRINT
+  if (audio_cat.is_debug()) {
+    audio_debug("effect parametes: ");
+    for (int i = 1; i < num_params + 1; ++i) {
+      audio_debug("param: " << i << ": " << params[i]);
+    }
+  }
+
+  switch (conf._type) {
+  
+  case FilterProperties::FT_echo:
+    // param a: FMOD_DSP_ECHO_DRYMIX
+    if (conf._a != 1.0) {
+      audio_warning("OpenAL: echo drymix parameter is not supported");
+    }
+    // param b: FMOD_DSP_ECHO_WETMIX
+    if (conf._b != 1.0) {
+      audio_warning("OpenAL: echo wetmix parameter is not supported");
+    }
+
+    // OpenAL has separate delay settings 
+    // for odd and even echo taps
+
+    // param c: FMOD_DSP_ECHO_DELAY: min: 10 max: 5000
+    // param c: AL_ECHO_RLDELAY: min: 0.0 max: 0.404
+    alEffectf(effect, AL_ECHO_LRDELAY, conf._c / 1000.0);
+    // param c: AL_ECHO_DELAY: min: 0.0 max: 0.207
+    alEffectf(effect, AL_ECHO_DELAY, 0);
+    errors[2] = alGetError();
+    
+    // param c: FMOD_DSP_ECHO_DECAYRATIO: min 0.0 max: 1.0
+    // param c: AL_ECHO_FEEDBACK: min: 0.0 max: 1.0
+    alEffectf(effect, AL_ECHO_FEEDBACK, conf._d);
+    errors[3]= alGetError();
+
+    // Set spread and damping to 0 to sound similar to FMOD
+
+    // param c: AL_ECHO_SPREAD: min: 0.0 max: 1.0
+    alEffectf(effect, AL_ECHO_SPREAD, 0.0);
+
+    // param c: AL_ECHO_DAMPING: min: 0.0 max: 1.0
+    alEffectf(effect, AL_ECHO_DAMPING, 0.0);
+
+    break;
+  
+  case FilterProperties::FT_flange:
+    // param a: FMOD_DSP_FLANGE_DRYMIX
+    if (conf._a != 1.0) {
+      audio_warning("OpenAL: flange drymix parameter is not supported");
+    }
+    // param b: FMOD_DSP_FLANGE_WETMIX
+    if (conf._b != 1.0) {
+      audio_warning("OpenAL: flange wetmix parameter is not supported");
+    }
+
+    // param c: FMOD_DSP_FLANGE_DEPTH: min: 0.01 max: 1.0
+    // param c: AL_FLANGER_DEPTH: min: 0 max: 1.0
+    alEffectf(effect, AL_FLANGER_DEPTH, conf._c);
+    errors[2] = alGetError();
+
+    // param d: FMOD_DSP_FLANGE_RATE: min: 0.01 max: 20.0
+    // param d: AL_FLANGER_RATE: min: 0.0 max: 10.0
+    alEffectf(effect, AL_FLANGER_RATE, conf._d);
+    errors[3] = alGetError();
+
+    // FMOD flanger delay is always 40 ms, while AL max flanger delay is only 4 ms
+    // Increase delay to the max to sound similar to FMOD
+
+    // param AL_FLANGER_DELAY: min: 0.0 max: 0.004
+    alEffectf(effect, AL_FLANGER_DELAY, 0.004);
+    
+    // param AL_FLANGER_WAVEFORM
+    // param AL_FLANGER_PHASE
+    // param AL_FLANGER_FEEDBACK
+
+    break;
+
+  case FilterProperties::FT_distort:
+    // Link distortion gaim with distortion edge
+    // to sound similar to FMOD
+
+    // param a: FMOD_DSP_DISTORTION_LEVEL
+    // param a: AL_DISTORTION_GAIN min: 0.01 max: 1.0
+    alEffectf(effect, AL_DISTORTION_GAIN, conf._a);
+    // param a: AL_DISTORTION_EDGE min: 0.0 max: 1.0
+    alEffectf(effect, AL_DISTORTION_EDGE, conf._a);
+    errors[0] = alGetError();
+
+    // Widen distortion bandwidth to sound similar to FMOD
+
+    // param: AL_DISTORTION_EQBANDWIDTH: min: 80.0 max: 24000
+    alEffectf(effect, AL_DISTORTION_EQBANDWIDTH, 24000.0);
+    
+    // param: AL_DISTORTION_LOWPASS_CUTOFF
+    // param: AL_DISTORTION_EQCENTER
+    break;
+  
+  case FilterProperties::FT_normalize:
+    // Not implemented in OpenAL
+    break;
+  
+  case FilterProperties::FT_parameq:
+    // Not implemented in OpenAL
+    break;
+  
+  case FilterProperties::FT_pitchshift:
+    // Convert relative octave ratio to semitiones
+    float tune;
+    if (conf._a > 0) {
+      tune = 12 / log(2) * log(conf._a);
+    }
+    else {
+      audio_error("Wrong pitch value: " << conf._a);
+      tune = 0.0;
+    }
+
+    // Convert fractional part to cents
+    fine = modf(tune, &coarse);
+    fine *= 100;
+
+    if (audio_cat.is_debug()) {
+      audio_debug("Fine tune: " << fine);
+    }
+    // param a: FMOD_DSP_PITCHSHIFT_PITCH: min: 0.5 max: 2.0
+
+    // param a: AL_PITCH_SHIFTER_COARSE_TUNE: min -12 max: 12
+    alEffecti(effect, AL_PITCH_SHIFTER_COARSE_TUNE, (ALint)coarse);
+
+    // param a: AL_PITCH_SHIFTER_FINE_TUNE: min -50 max: 50
+    alEffecti(effect, AL_PITCH_SHIFTER_FINE_TUNE, (ALint)fine);
+    errors[0] = alGetError();
+
+    audio_warning("OpenAL: pitchshift fftsize parameter is not supported");
+    audio_warning("OpenAL: pitchshift overlap parameter is not supported");
+    
+    break;
+  
+  case FilterProperties::FT_chorus:
+    // param a: FMOD_DSP_CHORUS_DRYMIX
+    if (conf._a != 0.5) {
+      audio_warning("OpenAL: chorus drymix parameter is not supported");
+    }
+    
+    // param b: FMOD_DSP_CHORUS_WETMIX1
+    if (conf._b != 0.5) {
+      audio_warning("OpenAL: chorus wetmix1 parameter is not supported");
+    }
+
+    // param c: FMOD_DSP_CHORUS_WETMIX2
+    if (conf._c != 0.5) {
+      audio_warning("OpenAL: chorus wetmix2 parameter is not supported");
+    }
+
+    // param d: FMOD_DSP_CHORUS_WETMIX3
+    if (conf._d != 0.5) {
+      audio_warning("OpenAL: chorus wetmix3 parameter is not supported");
+    }
+
+    // param e: FMOD_DSP_CHORUS_DELAY: min: 0.1 max: 100.0
+    // param e: AL_CHORUS_DELAY: min: 0.0 max: 0.16
+    alEffectf(effect, AL_CHORUS_DELAY, conf._e / 1000);
+    errors[4] = alGetError();
+
+    // param f: FMOD_DSP_CHORUS_RATE: min: 0.0 max: 20.0
+    // param f: AL_CHORUS_RATE: min: 0.0 max: 10.0
+    alEffectf(effect, AL_CHORUS_RATE, conf._f);
+    errors[5] = alGetError();
+    
+    // param g: FMOD_DSP_CHORUS_DEPTH: min: 0.0 max: 1.0
+    // param g: AL_CHORUS_DEPTH: min: 0.0 max: 1.0
+    alEffectf(effect, AL_CHORUS_DEPTH, conf._g);
+    errors[6] = alGetError();
+
+    // param: AL_CHORUS_PHASE
+    // param: AL_CHORUS_WAVEFORM
+    // param: AL_CHORUS_FEEDBACK
+
+    break;
+  
+  case FilterProperties::FT_sfxreverb:
+    // param a: FMOD_DSP_SFXREVERB_DRYMIX
+    if (conf._a != 1.0)
+      audio_warning("OpenAL: sfxreverb drymix parameter is not supported");
+
+    // param b: FMOD_DSP_SFXREVERB_ROOM: min: -10000.0 max: 0.0
+    // param b: AL_EAXREVERB_GAIN: min: 0.0 max: 1.0
+    alEffectf(effect, AL_EAXREVERB_GAIN, inverse_lerp(conf._b, -10000.0, 0.0));
+    errors[1] = alGetError();
+
+    // param c: FMOD_DSP_SFXREVERB_ROOMHF: min: -10000.0 max: 0.0
+    // param c: AL_EAXREVERB_GAINHF: min: 0.0 max: 1.0
+    alEffectf(effect, AL_EAXREVERB_GAINHF, inverse_lerp(conf._c, -10000.0, 0.0));
+    errors[2] = alGetError();
+
+    // param d: FMOD_DSP_SFXREVERB_DECAYTIME: min: 0.1 max: 20.0
+    // param d: AL_EAXREVERB_DECAY_TIME: min: 0.1 max: 20.0
+    alEffectf(effect, AL_EAXREVERB_DECAY_TIME, conf._d);
+    errors[3] = alGetError();
+
+    // param e: FMOD_DSP_SFXREVERB_DECAYHFRATIO: min: 0.1 max: 2.0
+    // param e: AL_EAXREVERB_DECAY_HFRATIO: min: 0.1 max: 2.0 (not 20.0 as in the docs)
+    alEffectf(effect, AL_EAXREVERB_DECAY_HFRATIO, conf._e);
+    errors[4] = alGetError();
+
+    // param f: FMOD_DSP_SFXREVERB_REFLECTIONSLEVEL: min: -10000.0 max: 1000
+    // param f: AL_EAXREVERB_REFLECTIONS_GAIN: min: 0.0 max: 3.16
+    alEffectf(effect, AL_EAXREVERB_REFLECTIONS_GAIN,
+      lerp(inverse_lerp(conf._f, -10000.0, 1000.0), 0.0, 3.16)
+    );
+    errors[5] = alGetError();
+
+    // param g: FMOD_DSP_SFXREVERB_REFLECTIONSDELAY: min: 0.0 max: 0.3
+    // param g: AL_EAXREVERB_REFLECTIONS_DELAY: min: 0.0 max: 0.3
+    alEffectf(effect, AL_EAXREVERB_REFLECTIONS_DELAY, conf._g);
+    errors[6] = alGetError();
+
+    // param h: FMOD_DSP_SFXREVERB_REVERBLEVEL: min: -10000.0 max: 2000.0
+    // param h: AL_EAXREVERB_LATE_REVERB_GAIN: min: 0.0 max: 10.0
+    alEffectf(effect, AL_EAXREVERB_LATE_REVERB_GAIN,
+      lerp(inverse_lerp(conf._h, -10000.0, 2000.0), 0.0, 10.0)
+    );
+    errors[7] = alGetError();
+
+    // param i: FMOD_DSP_SFXREVERB_REVERBDELAY: min: 0.0 max: 0.1
+    // param i: AL_EAXREVERB_LATE_REVERB_DELAY: min: 0.0 max: 0.1
+    alEffectf(effect, AL_EAXREVERB_LATE_REVERB_DELAY, conf._i);
+    errors[8] = alGetError();
+
+    // param j: FMOD_DSP_SFXREVERB_DIFFUSION: min: 0.0 max: 100.0
+    // param j: AL_EAXREVERB_DIFFUSION: min: 0.0 max: 1.0
+    alEffectf(effect, AL_EAXREVERB_DIFFUSION, inverse_lerp(conf._j, 0.0, 100.0));
+    errors[9] = alGetError();
+
+    // param k: FMOD_DSP_SFXREVERB_DENSITY: min: 0.0 max: 100.0
+    // param k: AL_EAXREVERB_DENSITY: min: 0.0 max: 1.0
+    alEffectf(effect, AL_EAXREVERB_DENSITY, inverse_lerp(conf._k, 0.0, 100.0));
+    errors[10] = alGetError();
+
+    // param l: FMOD_DSP_SFXREVERB_HFREFERENCE: min: 20.0 max: 20000.0
+    // param l: AL_EAXREVERB_HFREFERENCE: min: 1000.0 max: 20000.0
+    if (conf._l < AL_EAXREVERB_MIN_HFREFERENCE) {
+      alEffectf(effect, AL_EAXREVERB_HFREFERENCE, AL_EAXREVERB_MIN_HFREFERENCE);
+    }
+    else {
+      alEffectf(effect, AL_EAXREVERB_HFREFERENCE, conf._l);
+    }
+    errors[11] = alGetError();
+
+    // param m: FMOD_DSP_SFXREVERB_ROOMLF: min: -10000.0 max: 0.0
+    // param m: AL_EAXREVERB_GAINLF: min: 0.0 max: 1.0
+    alEffectf(effect, AL_EAXREVERB_GAINLF, 
+      lerp(inverse_lerp(conf._h, -10000.0, 0.0), 0.0, 1.0)
+    );
+    errors[12] = alGetError();
+
+    // param n: FMOD_DSP_SFXREVERB_LFREFERENCE: min: 20.0 max: 1000.0
+    // param n: AL_EAXREVERB_LFREFERENCE: min: 20.0 max: 1000.0
+    alEffectf(effect, AL_EAXREVERB_LFREFERENCE, conf._n);
+    errors[13] = alGetError();
+
+    // param: AL_EAXREVERB_DECAY_LFRATIO
+    // param: AL_EAXREVERB_REFLECTIONS_PAN
+    // param: AL_EAXREVERB_LATE_REVERB_PAN
+    // param: AL_EAXREVERB_ECHO_TIME
+    // param: AL_EAXREVERB_ECHO_DEPTH
+    // param: AL_EAXREVERB_MODULATION_TIME
+    // param: AL_EAXREVERB_MODULATION_DEPTH
+    // param: AL_EAXREVERB_AIR_ABSORPTION_GAINHF
+    // param: AL_EAXREVERB_DECAY_HFLIMIT
+
+    break;
+  
+  case FilterProperties::FT_compress:
+    // Has no parameters in OpenAL
+    alEffecti(effect, AL_COMPRESSOR_ONOFF, 1);
+    audio_warning("OpenAL: compressor threshold parameter is not supported");
+    audio_warning("OpenAL: compressor attack parameter is not supported");
+    audio_warning("OpenAL: compressor release parameter is not supported");
+    audio_warning("OpenAL: compressor gainmakeup parameter is not supported");
+    break;
+  }
+
+  // Check for errors
+  bool error_config = false;
+  for (int i = 0; i < num_params; ++i) {
+    if (errors[i] != AL_NO_ERROR) {
+      audio_error("Could not configure effect: " << alGetString(errors[i]));
+      if (errors[i] == AL_INVALID_VALUE) {
+        audio_error("Invalid parameter: " << params[i + 1]);
+      }
+      bool error_config = true;
+    }
+  }
+
+  if (!error_config) {
+    // Create slot if doesn't exist
+    ALuint* pt_slot = &_al_efx_slots[effect_type];
+    if (!alIsAuxiliaryEffectSlot(*pt_slot)) {
+      alGenAuxiliaryEffectSlots(1, (ALuint*)pt_slot);
+      ALuint err = alGetError();
+      if (err != AL_NO_ERROR) {
+        audio_error("OpenAL: failed to create effect slot " << *pt_slot << "\n");
+      }
+      else {
+        if (audio_cat.is_debug()) {
+          audio_debug("Created effect slot: " << *pt_slot);
+        }
+      }
+    }
+
+    // Load effect into slot
+    alAuxiliaryEffectSloti(*pt_slot, AL_EFFECTSLOT_EFFECT, (ALint)effect);
+    err = alGetError();
+    if (err != AL_NO_ERROR) {
+      audio_error("Can't load effect into slot, error: " << alGetString(err));
+    }
+    else {
+      if (audio_cat.is_debug()) {
+        audio_debug("Loaded effect " << effect << " into slot " << *pt_slot);
+      }
+      _al_efx_active_effect_types.insert(effect_type);
+      _al_efx_slots_ordered.push_back(*pt_slot);
+    }
+  }
+
+}
+
+/**
+* Configures existing effects/filters and creates new if they don't exist.
+* Unused effects are unloaded from the effect slots
+* Note: Filters and effects are differents entities in OpenAL EFX.
+*/
+bool OpenALAudioManager::configure_filters(FilterProperties* config)
+{
+  ReMutexHolder holder(_lock);
+
+  if (!_efx_supported) {
+    audio_error("ALC_EFX_EXT is not supported");
+    return false;
+  }
+
+  _al_efx_active_effect_types.clear();
+  _al_efx_active_filter = AL_FILTER_NULL;
+
+  const FilterProperties::ConfigVector& conf = config->get_config();
+  
+  // Effects added in the ConfigVector will be overriden by the latest effect of the same type
+  for (int i = 0; i < (int)(conf.size()); i++) {
+
+    if (conf[i]._type == FilterProperties::FT_lowpass || conf[i]._type == FilterProperties::FT_highpass) {
+      make_filter(conf[i]);
+    }
+    else {
+      make_effect(conf[i]);
+    }
+  }
+  
+  for (std::pair<ALuint, ALuint> el : _al_efx_effects) {
+    ALint slot = _al_efx_slots[el.first];
+
+    // Unload effects from unused slots
+    if (_al_efx_active_effect_types.find(el.first) == _al_efx_active_effect_types.end()) {
+      alAuxiliaryEffectSloti(slot, AL_EFFECTSLOT_EFFECT, AL_EFFECT_NULL);
+      ALuint err = alGetError();
+      if (err != AL_NO_ERROR) {
+        audio_error("Can't unload effect from slot, error: " << alGetString(err));
+      }
+      else {
+        if (audio_cat.is_debug()) {
+          audio_debug(<< "Unloaded effect " << el.first << " from slot " << slot);
+        }
+      }
+    }
+  }
+
+  // Chain effect slots
+  if (_efx_chain_supported) {
+    ALuint prev_slot = 0;
+    for (ALuint slot : _al_efx_slots_ordered) {
+      
+      alAuxiliaryEffectSloti(slot, AL_EFFECTSLOT_TARGET_SOFT, AL_EFFECTSLOT_NULL);
+      ALuint err = alGetError();
+      if (err != AL_NO_ERROR) {
+        audio_error("Can't unchain slot " << slot << ", error: " << alGetString(err));
+      }
+      else {
+        if (audio_cat.is_debug()) {
+          audio_debug("Unchained effect slot " << slot);
+        }
+      }
+
+      if (prev_slot > 0 && slot != prev_slot) {
+        alAuxiliaryEffectSloti(prev_slot, AL_EFFECTSLOT_TARGET_SOFT, slot);
+        err = alGetError();
+        if (err != AL_NO_ERROR) {
+          audio_error("Can't chain slot " << prev_slot << " to slot " << slot << ", error: " << alGetString(err));
+        }
+        else {
+          if (audio_cat.is_debug()) {
+            audio_debug("Chained effect slot " << prev_slot << " to effect slot " << slot);
+          }
+        }
+      }
+      prev_slot = slot;
+    }
+  }
+
+  // Apply effects and filters for currently playing sounds
+  for (OpenALAudioSound* sound : _sounds_playing) {
+    connect_direct_filter(sound->_source);
+    connect_to_slots(sound->_source);
+  }
+
+  return true;
+}
+
+/**
+*Connects sound source to all active effect slots through corresponding sends
+*/
+void OpenALAudioManager::
+connect_to_slots(ALuint source) {
+  ReMutexHolder holder(_lock);
+
+  ALuint send = 0;
+  for (ALuint effect_type : _al_efx_active_effect_types) {
+    ALint slot = _al_efx_slots[effect_type];
+    if (alIsAuxiliaryEffectSlot(slot)) {
+      alSource3i(source, AL_AUXILIARY_SEND_FILTER, slot, send, _al_efx_active_filter);
+      ALuint err = alGetError();
+      if (err != AL_NO_ERROR) {
+        audio_error("Can't connect source to effect slot: " << alGetString(err));
+      }
+      else {
+        if (audio_cat.is_debug()) {
+          audio_debug("Connected source to effect slot " << slot << " through send " << send);
+        }
+      }
+    }
+    send++;
+  }
+}
+
+/**
+*Connects the current active filter to the dry path of the sound source
+*/
+void OpenALAudioManager::
+connect_direct_filter(ALuint source) {
+  ReMutexHolder holder(_lock);
+
+  if (alIsFilter(_al_efx_active_filter) && _al_efx_active_filter != AL_FILTER_NULL) {
+    ALuint err;
+    alSourcei(source, AL_DIRECT_FILTER, _al_efx_active_filter);
+    err = alGetError();
+    if (err != AL_NO_ERROR) {
+      audio_error("Can't connect direct filter to source: " << alGetString(err));
+    }
+  }
 }
 
 /**
@@ -885,8 +1573,14 @@ starting_sound(OpenALAudioSound* audio) {
 
   audio->_source = source;
 
-  if (source)
+  if (source) {
+    if (_efx_supported) {
+      // Apply EFX
+      connect_direct_filter(source);
+      connect_to_slots(source);
+    }
     _sounds_playing.insert(audio);
+  }
 }
 
 /**
@@ -1028,6 +1722,16 @@ cleanup() {
       al_audio_errcheck("alDeleteSources()");
       delete [] sources;
       _al_sources->clear();
+
+      // Delete effect slots
+      for (std::pair<ALuint, ALuint> el : _al_efx_slots) {
+        alDeleteAuxiliaryEffectSlots(1, &el.second);
+      }
+
+      // Delete effects
+      for (std::pair<ALuint, ALuint> el : _al_efx_effects) {
+        alDeleteEffects(1, &el.second);
+      }
 
       // make sure that the context is not current when it is destroyed
       alcGetError(_device); // clear errors

@@ -26,15 +26,68 @@
 #ifdef HAVE_OPENAL_FRAMEWORK
   #include <OpenAL/al.h>
   #include <OpenAL/alc.h>
+  #include <OpenAL/efx.h>
 #else
   #include <AL/al.h>
   #include <AL/alc.h>
+  #include <AL/efx.h>
 #endif
+
+// Maximum amount of available filters to index _al_efx_filters array
+#define AL_EFX_NUM_FILTERS 3
+// Sends to connect source to every effect implemented in OpenALAudioManager
+#define AL_EFX_NUM_SENDS 7
 
 class OpenALAudioSound;
 
 extern void al_audio_errcheck(const char *context);
 extern void alc_audio_errcheck(const char *context,ALCdevice* device);
+
+extern void al_efx_load_functions();
+
+float lerp(float t, float a, float b);
+float inverse_lerp(float t, float a, float b);
+
+// Pointers to OpenAL EFX extension library functions
+
+/* Effect object functions */
+static LPALGENEFFECTS alGenEffects;
+static LPALDELETEEFFECTS alDeleteEffects;
+static LPALISEFFECT alIsEffect;
+static LPALEFFECTI alEffecti;
+static LPALEFFECTIV alEffectiv;
+static LPALEFFECTF alEffectf;
+static LPALEFFECTFV alEffectfv;
+static LPALGETEFFECTI alGetEffecti;
+static LPALGETEFFECTIV alGetEffectiv;
+static LPALGETEFFECTF alGetEffectf;
+static LPALGETEFFECTFV alGetEffectfv;
+
+/* Filter object functions */
+static LPALGENFILTERS alGenFilters;
+static LPALDELETEFILTERS alDeleteFilters;
+static LPALISFILTER alIsFilter;
+static LPALFILTERI alFilteri;
+static LPALFILTERIV alFilteriv;
+static LPALFILTERF alFilterf;
+static LPALFILTERFV alFilterfv;
+static LPALGETFILTERI alGetFilteri;
+static LPALGETFILTERIV alGetFilteriv;
+static LPALGETFILTERF alGetFilterf;
+static LPALGETFILTERFV alGetFilterfv;
+
+/* Auxiliary Effect Slot object functions */
+static LPALGENAUXILIARYEFFECTSLOTS alGenAuxiliaryEffectSlots;
+static LPALDELETEAUXILIARYEFFECTSLOTS alDeleteAuxiliaryEffectSlots;
+static LPALISAUXILIARYEFFECTSLOT alIsAuxiliaryEffectSlot;
+static LPALAUXILIARYEFFECTSLOTI alAuxiliaryEffectSloti;
+static LPALAUXILIARYEFFECTSLOTIV alAuxiliaryEffectSlotiv;
+static LPALAUXILIARYEFFECTSLOTF alAuxiliaryEffectSlotf;
+static LPALAUXILIARYEFFECTSLOTFV alAuxiliaryEffectSlotfv;
+static LPALGETAUXILIARYEFFECTSLOTI alGetAuxiliaryEffectSloti;
+static LPALGETAUXILIARYEFFECTSLOTIV alGetAuxiliaryEffectSlotiv;
+static LPALGETAUXILIARYEFFECTSLOTF alGetAuxiliaryEffectSlotf;
+static LPALGETAUXILIARYEFFECTSLOTFV alGetAuxiliaryEffectSlotfv;
 
 class EXPCL_OPENAL_AUDIO OpenALAudioManager : public AudioManager {
   class SoundData;
@@ -137,6 +190,13 @@ private:
   void cleanup();
 
 private:
+  void make_filter(const FilterProperties::FilterConfig& conf);
+  void make_effect(const FilterProperties::FilterConfig& conf);
+  void connect_to_slots(ALuint source);
+  void connect_direct_filter(ALuint source);
+  virtual bool configure_filters(FilterProperties* config);
+
+private:
   // This global lock protects all access to OpenAL library interfaces.
   static ReMutex _lock;
 
@@ -214,6 +274,31 @@ private:
   ALfloat _position[3];
   ALfloat _velocity[3];
   ALfloat _forward_up[6];
+
+ private:
+   bool _efx_supported;
+   bool _efx_chain_supported;
+  
+   /*
+   The 2 maps below should have identical mapping in normal conditions
+   They are distinguished only semantically
+   Array type is not used because of AL_EFFECT_EAXREVERB value (0x8000)
+  */
+   // Effect type to effect ID mapping
+   std::map<ALuint, ALuint> _al_efx_effects;
+   // Effect type to effect slot ID mapping
+   std::map<ALuint, ALuint> _al_efx_slots;
+
+   // Vector to maintain the order in which effects were added 
+   // to chain them accordingly
+   std::vector<ALuint> _al_efx_slots_ordered;
+
+   // Currently initialized effect types
+   std::set<ALuint> _al_efx_active_effect_types;
+   // Filter type to filter ID mapping
+   ALuint _al_efx_filters[AL_EFX_NUM_FILTERS];
+   // OpenAL EFX allows to have only one active direct filter
+   ALuint _al_efx_active_filter;
 
   // These are needed for Panda's Pointer System.  DO NOT ERASE!
 
